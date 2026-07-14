@@ -132,7 +132,7 @@ const PROVIDERS: Record<AIProvider, ProviderDef> = {
   },
   minimax: {
     label: 'MiniMax',
-    baseURL: (process.env.MINIMAX_BASE_URL ?? 'https://api.minimax.io/v1').replace(/\/$/, ''),
+    baseURL: (process.env.MINIMAX_BASE_URL || 'https://api.minimax.io/v1').replace(/\/$/, ''),
     authHeader: 'Authorization',
     needsAnthropicVersion: false,
     modelEnvVar: 'MINIMAX_MODEL',
@@ -140,7 +140,7 @@ const PROVIDERS: Record<AIProvider, ProviderDef> = {
   },
   gemini: {
     label: 'Google Gemini',
-    baseURL: (process.env.GEMINI_BASE_URL ?? 'https://generativelanguage.googleapis.com/v1beta/openai').replace(/\/$/, ''),
+    baseURL: (process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta/openai').replace(/\/$/, ''),
     authHeader: 'Authorization',
     needsAnthropicVersion: false,
     modelEnvVar: 'GEMINI_MODEL',
@@ -148,7 +148,7 @@ const PROVIDERS: Record<AIProvider, ProviderDef> = {
   },
   custom: {
     label: 'Custom Provider',
-    baseURL: (process.env.CUSTOM_BASE_URL ?? 'http://localhost:11434/v1').replace(/\/$/, ''),
+    baseURL: (process.env.CUSTOM_BASE_URL || 'http://localhost:11434/v1').replace(/\/$/, ''),
     authHeader: 'Authorization',
     needsAnthropicVersion: false,
     modelEnvVar: 'CUSTOM_MODEL',
@@ -617,20 +617,12 @@ export class AiClient {
     let url: string = buildUrlFor(candidates[currentCandidateIdx]);
 
     // ── 429 retry with multi-key rotation (v1.83) ────────────────────────────
-    // v1.83 — extended from "same key, fixed backoff" to "rotate to
-    // the next healthy candidate on 429". On a 429:
-    //   1. Mark the current key unhealthy (in-memory + persisted).
-    //   2. Step to the next candidate. If none remain, surface the
-    //      last error to the caller.
-    // The pre-v1.83 fixed-backoff loop is preserved for the LEGACY
-    // single-key path (candidates.length === 1 with the resolved
-    // env/legacy key) so a single admin-managed key still gets the
-    // advertised-backoff retry that admins rely on.
     const MAX_429_ATTEMPTS = candidates.length > 1 ? candidates.length : 3;
     let attempt = 0;
     let lastError: Error | null = null;
     let res: Response;
     let rotatedThisLoop = false;
+    let drainText = '';
     while (true) {
       try {
         res = await fetch(url, {
@@ -639,7 +631,6 @@ export class AiClient {
           body: JSON.stringify(body),
         });
       } catch (err) {
-        // Network-level failure (DNS, TLS, abort, etc.) — no HTTP status.
         logAiApiFailure({
           kind: 'inference',
           provider: config.provider,
@@ -652,19 +643,13 @@ export class AiClient {
         throw err;
       }
       if (res.status !== 429) {
-        // Success or non-retriable failure — clear this candidate's
-        // unhealthy hint (in case it was previously set) and exit.
         clearUnhealthy(config.provider, candidates[currentCandidateIdx].label);
         break;
       }
-      // Mark current key unhealthy — admins expect this candidate to
-      // be skipped on subsequent requests until the cooldown expires.
       const failedLabel = candidates[currentCandidateIdx].label;
       markUnhealthy(config.provider, failedLabel);
-      // Drain the body so the connection is freed before we sleep.
-      await res.text().catch(() => undefined);
+      drainText = await res.text().catch(() => '');
 
-      // Try to rotate to the next candidate.
       if (currentCandidateIdx + 1 < candidates.length) {
         currentCandidateIdx++;
         url = buildUrlFor(candidates[currentCandidateIdx]);
@@ -677,8 +662,6 @@ export class AiClient {
         continue;
       }
 
-      // No more candidates. Single-key path: respect the Retry-After
-      // header (or exponential backoff) and retry the same key.
       if (candidates.length === 1 && attempt + 1 < MAX_429_ATTEMPTS) {
         attempt++;
         const retryAfterHeader = res.headers.get('retry-after');
@@ -694,8 +677,6 @@ export class AiClient {
         continue;
       }
 
-      // All candidates exhausted AND no further single-key retries
-      // — surface the last response as the error.
       lastError = new Error(
         `${config.provider} API rate-limited across ${candidates.length} key(s); last response ${res.status}.`,
       );
@@ -703,9 +684,6 @@ export class AiClient {
     }
 
     if (rotatedThisLoop && lastError) {
-      // Reuse the post-loop error path so callers see the same
-      // shape regardless of whether the failure was on the first
-      // candidate or after rotating through all of them.
       logAiApiFailure({
         kind: 'inference',
         provider: config.provider,
@@ -721,7 +699,7 @@ export class AiClient {
     }
 
     if (!res.ok) {
-      const text = await res.text();
+      const text = res.status === 429 ? drainText : await res.text();
       const err = new Error(`${config.provider} API error (${res.status}): ${text.slice(0, 300)}`);
       logAiApiFailure({
         kind: 'inference',
@@ -732,9 +710,6 @@ export class AiClient {
         batchId,
         error: err.message,
         status: res.status,
-        // Persist the outgoing body so admins can debug schema mismatches
-        // with custom / proxied providers (e.g. relays that rename `model`
-        // → `modelName` and forward to Groq). Cap at 2KB to keep docs small.
         requestBody: body,
       });
       throw err;
