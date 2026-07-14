@@ -127,3 +127,9 @@ See [docs/ARCHITECTURE.md#10-env-variables-reference](docs/ARCHITECTURE.md#10-en
 ## License
 
 [MIT](./LICENSE) © 2026 vicharanashala
+
+---
+
+## Credits
+
+#credit to Vanshika Ramkrushna Bhoyar.
